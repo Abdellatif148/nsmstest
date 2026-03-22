@@ -1,0 +1,56 @@
+# ============================================================
+# docker-compose.yml — Local development environment
+# Run everything with: docker-compose up
+# This starts: your API + Redis + Supabase (local)
+# ============================================================
+
+version: '3.9'
+
+services:
+
+  # Your SMS API
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=development
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./src:/app/src  # Hot reload in development
+    restart: unless-stopped
+
+  # Redis for bulk SMS queue
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # Redis admin UI (development only)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    profiles:
+      - debug  # Only starts with: docker-compose --profile debug up
+
+volumes:
+  redis_data:

@@ -1,0 +1,39 @@
+# ============================================================
+# .gitignore — CRITICAL SECURITY FILE
+# Without this: your API keys, database passwords, and secrets
+# go to GitHub and are PUBLIC to the entire internet
+# ============================================================
+
+# Environment files — NEVER commit these
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+
+# Dependencies — too large, regenerated with npm install
+node_modules/
+npm-debug.log*
+
+# Log files — contain sensitive request data
+logs/
+*.log
+
+# Test coverage reports
+coverage/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+
+# Build outputs
+dist/
+build/
+
+# Docker volumes (if running locally)
+redis_data/
