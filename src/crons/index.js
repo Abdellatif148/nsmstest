@@ -1,204 +1,343 @@
-// ============================================================
-// src/crons/index.js
-// Scheduled background tasks that run automatically
-// Like alarm clocks for your server
-// ============================================================
-
+/**
+ * crons/index.js — All background jobs
+ *
+ * Schedule (cron syntax):
+ * ┌───── second (0-59)
+ * │ ┌──── minute (0-59)
+ * │ │ ┌─── hour (0-23)
+ * │ │ │ ┌── day of month (1-31)
+ * │ │ │ │ ┌─ month (1-12)
+ * │ │ │ │ │ ┌ day of week (0-6)
+ */
 const cron = require('node-cron')
-const logger = require('../config/logger')
 const { supabase } = require('../config/database')
-const { checkGatewayHealth } = require('../services/GatewayService')
-const { cleanupExpiredOtps } = require('../services/OtpService')
-const { notifyLowCredits } = require('../services/WebhookService')
+const logger = require('../config/logger')
+const EmailService = require('../services/EmailService')
+const SmsService = require('../services/SmsService')
 
-// ── CRON SCHEDULE REFERENCE ───────────────────────────────
-// Format: second minute hour day month weekday
-// Example: '0 * * * *' = every hour at :00
-//          '*/5 * * * *' = every 5 minutes
-//          '0 2 * * *' = every day at 2:00am
+function startCrons() {
+  logger.info('Starting cron jobs...')
 
-// ── GATEWAY HEALTH CHECK — every 5 minutes ────────────────
-cron.schedule('*/5 * * * *', async () => {
-  try {
-    const health = await checkGatewayHealth()
+  // ── 1. GATEWAY HEALTH CHECK — every 5 minutes ─────────────
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      const AT = require('africastalking')({
+        apiKey: process.env.AT_API_KEY,
+        username: process.env.AT_USERNAME
+      })
+      // Ping by checking application data
+      await AT.APPLICATION.fetchApplicationData()
+      await supabase.from('gateway_health').upsert({
+        gateway: 'africastalking',
+        status: 'healthy',
+        checked_at: new Date().toISOString()
+      })
+    } catch (e) {
+      await supabase.from('gateway_health').upsert({
+        gateway: 'africastalking',
+        status: 'degraded',
+        error: e.message,
+        checked_at: new Date().toISOString()
+      })
+      logger.error('Gateway health check failed:', e.message)
+    }
+  })
 
-    // Alert if any gateway is degraded
-    Object.entries(health).forEach(([gateway, status]) => {
-      if (status.status === 'degraded') {
-        logger.warn('ALERT: Gateway degraded', { gateway, ...status })
-        // In production: send alert to your monitoring tool
-        // Slack webhook, PagerDuty, email, etc.
+  // ── 2. PROCESS SCHEDULED MESSAGES — every minute ──────────
+  cron.schedule('* * * * *', async () => {
+    try {
+      const now = new Date().toISOString()
+      const { data: pending } = await supabase
+        .from('scheduled_messages')
+        .select('*')
+        .eq('status', 'pending')
+        .lte('scheduled_at', now)
+        .limit(50)
+
+      if (!pending || pending.length === 0) return
+
+      for (const scheduled of pending) {
+        try {
+          // Mark as processing first
+          await supabase
+            .from('scheduled_messages')
+            .update({ status: 'processing', started_at: now })
+            .eq('id', scheduled.id)
+
+          let recipients = scheduled.recipients || []
+
+          // If has list_id, get contacts from list
+          if (scheduled.list_id) {
+            const { data: contacts } = await supabase
+              .from('contacts')
+              .select('phone')
+              .eq('list_id', scheduled.list_id)
+            recipients = (contacts || []).map(c => c.phone)
+          }
+
+          if (recipients.length === 0) {
+            await supabase.from('scheduled_messages')
+              .update({ status: 'failed', error: 'No recipients' })
+              .eq('id', scheduled.id)
+            continue
+          }
+
+          // Send bulk or single
+          if (recipients.length === 1) {
+            await SmsService.sendSMS({
+              clientId: scheduled.client_id,
+              to: recipients[0],
+              message: scheduled.message,
+              senderId: scheduled.sender_id,
+              messageType: 'transactional',
+              scheduledJobId: scheduled.id
+            })
+          } else {
+            // Queue as bulk job
+            const { addBulkJob } = require('../queues/BulkSmsQueue')
+            await addBulkJob.add({
+              clientId: scheduled.client_id,
+              recipients,
+              message: scheduled.message,
+              senderId: scheduled.sender_id,
+              scheduledJobId: scheduled.id
+            })
+          }
+
+          await supabase.from('scheduled_messages')
+            .update({
+              status: 'completed',
+              completed_at: new Date().toISOString(),
+              total_recipients: recipients.length
+            })
+            .eq('id', scheduled.id)
+
+          logger.info(`Scheduled message ${scheduled.id} sent to ${recipients.length} recipients`)
+        } catch (e) {
+          await supabase.from('scheduled_messages')
+            .update({ status: 'failed', error: e.message })
+            .eq('id', scheduled.id)
+          logger.error(`Scheduled message ${scheduled.id} failed:`, e.message)
+        }
       }
-    })
-
-  } catch (err) {
-    logger.error('Gateway health check failed', { error: err.message })
-  }
-}, {
-  name: 'gateway-health-check'
-})
-
-// ── CLEANUP EXPIRED OTPs — every hour ─────────────────────
-cron.schedule('0 * * * *', async () => {
-  try {
-    const deleted = await cleanupExpiredOtps()
-    if (deleted > 0) {
-      logger.info('Expired OTP cleanup', { deleted })
+    } catch (e) {
+      logger.error('Scheduled message cron error:', e.message)
     }
-  } catch (err) {
-    logger.error('OTP cleanup failed', { error: err.message })
-  }
-}, {
-  name: 'otp-cleanup'
-})
+  })
 
-// ── LOW CREDITS NOTIFICATIONS — every 6 hours ─────────────
-cron.schedule('0 */6 * * *', async () => {
-  try {
-    // Find all clients with low credits
-    const threshold = 100  // Less than 100 DH
-    const { data: lowCreditClients } = await supabase
-      .from('clients')
-      .select('id, credits, email, name')
-      .lt('credits', threshold)
-      .eq('status', 'active')
-      .gt('credits', 0)  // Not zero — they already know
+  // ── 3. LOW CREDITS ALERT — every 6 hours ──────────────────
+  cron.schedule('0 */6 * * *', async () => {
+    try {
+      const { data: clients } = await supabase
+        .from('clients')
+        .select('id, name, email, plan')
+        .eq('status', 'active')
 
-    if (!lowCreditClients?.length) return
+      const THRESHOLD = 100 // DH
 
-    logger.info('Low credit notifications', { count: lowCreditClients.length })
+      for (const client of (clients || [])) {
+        const { data: billing } = await supabase
+          .from('billing')
+          .select('amount, type')
+          .eq('client_id', client.id)
 
-    for (const client of lowCreditClients) {
-      await notifyLowCredits(client.id, client.credits)
+        const credits = (billing || []).reduce((s, b) => b.type === 'credit' ? s + b.amount : s - b.amount, 0)
+
+        if (credits > 0 && credits < THRESHOLD) {
+          // Check if we already sent alert in last 24h
+          const { data: recentAlert } = await supabase
+            .from('email_logs')
+            .select('id')
+            .eq('client_id', client.id)
+            .eq('type', 'low_credits')
+            .gt('sent_at', new Date(Date.now() - 24 * 3600000).toISOString())
+            .single()
+
+          if (!recentAlert) {
+            try {
+              await EmailService.sendLowCreditsWarning({ ...client, credits: credits.toFixed(2) })
+              await supabase.from('email_logs').insert({
+                client_id: client.id,
+                type: 'low_credits',
+                sent_at: new Date().toISOString()
+              })
+              logger.info(`Low credits alert sent to ${client.email}`)
+            } catch (e) {
+              logger.error(`Low credits email failed for ${client.email}:`, e.message)
+            }
+          }
+        }
+      }
+    } catch (e) {
+      logger.error('Low credits cron error:', e.message)
     }
+  })
 
-  } catch (err) {
-    logger.error('Low credits notification failed', { error: err.message })
-  }
-}, {
-  name: 'low-credits-alert'
-})
+  // ── 4. DAILY STATS SNAPSHOT — every day at midnight ───────
+  cron.schedule('0 0 * * *', async () => {
+    try {
+      const yesterday = new Date(Date.now() - 86400000)
+      const startOfDay = new Date(yesterday.setHours(0, 0, 0, 0)).toISOString()
+      const endOfDay = new Date(yesterday.setHours(23, 59, 59, 999)).toISOString()
 
-// ── DAILY DELIVERY STATS — every day at midnight ──────────
-cron.schedule('0 0 * * *', async () => {
-  try {
-    const yesterday = new Date()
-    yesterday.setDate(yesterday.getDate() - 1)
-    yesterday.setHours(0, 0, 0, 0)
+      const { data: messages } = await supabase
+        .from('messages')
+        .select('client_id, status, cost, network')
+        .gte('created_at', startOfDay)
+        .lte('created_at', endOfDay)
 
-    const endOfYesterday = new Date(yesterday)
-    endOfYesterday.setHours(23, 59, 59, 999)
+      if (!messages) return
 
-    // Get yesterday's stats
-    const { data: messages } = await supabase
-      .from('messages')
-      .select('status, cost, gateway')
-      .gte('created_at', yesterday.toISOString())
-      .lte('created_at', endOfYesterday.toISOString())
+      // Group by client
+      const statsMap = {}
+      for (const msg of messages) {
+        if (!statsMap[msg.client_id]) {
+          statsMap[msg.client_id] = { sent: 0, delivered: 0, failed: 0, cost: 0 }
+        }
+        statsMap[msg.client_id].sent++
+        if (msg.status === 'delivered') statsMap[msg.client_id].delivered++
+        if (msg.status === 'failed') statsMap[msg.client_id].failed++
+        statsMap[msg.client_id].cost += msg.cost || 0
+      }
 
-    if (!messages) return
+      for (const [clientId, stats] of Object.entries(statsMap)) {
+        await supabase.from('daily_stats').upsert({
+          client_id: clientId,
+          date: startOfDay.split('T')[0],
+          sent: stats.sent,
+          delivered: stats.delivered,
+          failed: stats.failed,
+          cost_dh: parseFloat(stats.cost.toFixed(4)),
+          delivery_rate: stats.sent > 0 ? parseFloat(((stats.delivered / stats.sent) * 100).toFixed(2)) : 0
+        })
+      }
 
-    const stats = {
-      date: yesterday.toISOString().split('T')[0],
-      total: messages.length,
-      delivered: messages.filter(m => m.status === 'delivered').length,
-      failed: messages.filter(m => m.status === 'failed').length,
-      revenue: messages.reduce((sum, m) => sum + (parseFloat(m.cost) || 0), 0).toFixed(2),
-      byGateway: {}
+      logger.info(`Daily stats snapshot: ${Object.keys(statsMap).length} clients`)
+    } catch (e) {
+      logger.error('Daily stats cron error:', e.message)
     }
+  })
 
-    messages.forEach(m => {
-      if (!stats.byGateway[m.gateway]) stats.byGateway[m.gateway] = 0
-      stats.byGateway[m.gateway]++
-    })
+  // ── 5. MONTHLY REPORT — 1st of every month at 8am ─────────
+  cron.schedule('0 8 1 * *', async () => {
+    try {
+      const now = new Date()
+      const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1)
+      const monthName = lastMonth.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })
+      const startOfMonth = lastMonth.toISOString()
+      const endOfMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59).toISOString()
 
-    stats.deliveryRate = stats.total > 0
-      ? ((stats.delivered / stats.total) * 100).toFixed(1) + '%'
-      : '0%'
+      const { data: clients } = await supabase
+        .from('clients')
+        .select('id, name, email, plan')
+        .eq('status', 'active')
 
-    logger.info('Daily stats', stats)
+      for (const client of (clients || [])) {
+        const { data: messages } = await supabase
+          .from('messages')
+          .select('status, cost')
+          .eq('client_id', client.id)
+          .gte('created_at', startOfMonth)
+          .lte('created_at', endOfMonth)
 
-    // Save daily summary to database
-    await supabase.from('daily_stats').upsert({
-      date: stats.date,
-      total_messages: stats.total,
-      delivered: stats.delivered,
-      failed: stats.failed,
-      revenue_dh: parseFloat(stats.revenue),
-      delivery_rate: parseFloat(stats.deliveryRate),
-      created_at: new Date().toISOString()
-    })
+        if (!messages || messages.length === 0) continue
 
-  } catch (err) {
-    logger.error('Daily stats failed', { error: err.message })
-  }
-}, {
-  name: 'daily-stats'
-})
+        const sent = messages.length
+        const delivered = messages.filter(m => m.status === 'delivered').length
+        const cost = messages.reduce((s, m) => s + (m.cost || 0), 0)
 
-// ── STALE PENDING MESSAGES — every 30 minutes ─────────────
-// Messages stuck in "pending" for more than 30 minutes are likely failed
-cron.schedule('*/30 * * * *', async () => {
-  try {
-    const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+        const { data: billing } = await supabase
+          .from('billing')
+          .select('amount, type')
+          .eq('client_id', client.id)
+        const credits = (billing || []).reduce((s, b) => b.type === 'credit' ? s + b.amount : s - b.amount, 0)
 
-    const { count } = await supabase
-      .from('messages')
-      .update({ status: 'failed', failure_reason: 'timeout_no_delivery_report' })
-      .eq('status', 'pending')
-      .lt('created_at', thirtyMinutesAgo)
-      .select('*', { count: 'exact', head: true })
-
-    if (count > 0) {
-      logger.warn('Marked stale messages as failed', { count })
+        try {
+          await EmailService.sendMonthlyReport(
+            { ...client, credits: credits.toFixed(2) },
+            {
+              month: monthName,
+              sent,
+              delivered,
+              delivery_rate: sent > 0 ? `${((delivered / sent) * 100).toFixed(1)}%` : '0%',
+              cost_dh: cost.toFixed(2)
+            }
+          )
+          logger.info(`Monthly report sent to ${client.email}`)
+        } catch (e) {
+          logger.error(`Monthly report failed for ${client.email}:`, e.message)
+        }
+      }
+    } catch (e) {
+      logger.error('Monthly report cron error:', e.message)
     }
+  })
 
-  } catch (err) {
-    logger.error('Stale message cleanup failed', { error: err.message })
-  }
-}, {
-  name: 'stale-message-cleanup'
-})
-
-// ── DATABASE SIZE MONITORING — once a day ─────────────────
-cron.schedule('0 3 * * *', async () => {
-  try {
-    // Count total records — alert if approaching limits
-    const { count: messageCount } = await supabase
-      .from('messages')
-      .select('*', { count: 'exact', head: true })
-
-    const { count: clientCount } = await supabase
-      .from('clients')
-      .select('*', { count: 'exact', head: true })
-
-    logger.info('Database stats', {
-      messages: messageCount,
-      clients: clientCount
-    })
-
-    // Supabase free tier: 500MB storage
-    // At ~500 bytes per message: 500MB ≈ 1,000,000 messages
-    if (messageCount > 800000) {
-      logger.warn('ALERT: Approaching database storage limit. Consider upgrading Supabase plan.')
+  // ── 6. STALE MESSAGES CLEANUP — every 30 minutes ──────────
+  cron.schedule('*/30 * * * *', async () => {
+    try {
+      const staleTime = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+      const { data: stale } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('status', 'pending')
+        .lt('created_at', staleTime)
+      if (stale && stale.length > 0) {
+        await supabase
+          .from('messages')
+          .update({ status: 'failed', gateway_response: 'Timeout: no delivery report received' })
+          .in('id', stale.map(m => m.id))
+        logger.info(`Marked ${stale.length} stale messages as failed`)
+      }
+    } catch (e) {
+      logger.error('Stale messages cron error:', e.message)
     }
+  })
 
-  } catch (err) {
-    logger.error('DB monitoring failed', { error: err.message })
-  }
-}, {
-  name: 'db-monitoring'
-})
+  // ── 7. OTP CLEANUP — every hour ───────────────────────────
+  cron.schedule('0 * * * *', async () => {
+    try {
+      const expiredTime = new Date(Date.now() - 15 * 60 * 1000).toISOString()
+      const { count } = await supabase
+        .from('otp_codes')
+        .delete()
+        .lt('expires_at', expiredTime)
+        .select('id', { count: 'exact' })
+      if (count > 0) logger.info(`Cleaned up ${count} expired OTP codes`)
+    } catch (e) {
+      logger.error('OTP cleanup cron error:', e.message)
+    }
+  })
 
-logger.info('Cron jobs scheduled', {
-  jobs: [
-    'gateway-health: every 5 minutes',
-    'otp-cleanup: every hour',
-    'low-credits: every 6 hours',
-    'daily-stats: midnight',
-    'stale-messages: every 30 minutes',
-    'db-monitoring: 3am daily'
-  ]
-})
+  // ── 8. CLEANUP EXPIRED LINKS — every 24h ──────────────────
+  cron.schedule('0 3 * * *', async () => {
+    try {
+      const { count } = await supabase
+        .from('tracked_links')
+        .delete()
+        .not('expires_at', 'is', null)
+        .lt('expires_at', new Date().toISOString())
+        .select('id', { count: 'exact' })
+      if (count > 0) logger.info(`Cleaned up ${count} expired tracked links`)
+    } catch (e) {
+      logger.error('Links cleanup cron error:', e.message)
+    }
+  })
 
-module.exports = {}  // Crons start when this file is imported
+  // ── 9. DATABASE MONITORING — every day at 3am ─────────────
+  cron.schedule('0 3 * * *', async () => {
+    try {
+      const tables = ['messages', 'clients', 'billing', 'otp_codes']
+      for (const table of tables) {
+        const { count } = await supabase.from(table).select('id', { count: 'exact', head: true })
+        logger.info(`DB monitor — ${table}: ${count} rows`)
+      }
+    } catch (e) {
+      logger.error('DB monitoring cron error:', e.message)
+    }
+  })
+
+  logger.info('✓ All cron jobs started (9 jobs)')
+}
+
+module.exports = { startCrons }

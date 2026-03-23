@@ -37,3 +37,4 @@ build/
 
 # Docker volumes (if running locally)
 redis_data/
+logs/

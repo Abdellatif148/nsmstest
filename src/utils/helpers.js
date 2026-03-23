@@ -2,11 +2,9 @@
 // src/utils/helpers.js
 // Small utility functions used across the codebase
 // ============================================================
-
 const crypto = require('crypto')
 
 // ── MASK SENSITIVE DATA ───────────────────────────────────
-// Never log full phone numbers or API keys
 function maskPhone(phone) {
   if (!phone) return 'unknown'
   return phone.substring(0, 6) + '****' + phone.slice(-2)
@@ -36,13 +34,17 @@ function generateSecureToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('hex')
 }
 
+// ── GENERATE API KEY ──────────────────────────────────────
+function generateApiKey() {
+  return 'nk_live_' + crypto.randomBytes(24).toString('hex')
+}
+
 // ── FORMAT DH AMOUNT ──────────────────────────────────────
 function formatDH(amount) {
   return parseFloat(amount).toFixed(2) + ' DH'
 }
 
 // ── CHUNK ARRAY ───────────────────────────────────────────
-// Split [1,2,3,4,5] into [[1,2],[3,4],[5]] with size 2
 function chunk(array, size) {
   const chunks = []
   for (let i = 0; i < array.length; i += size) {
@@ -64,21 +66,18 @@ function truncate(str, length = 50) {
 }
 
 // ── RETRY FUNCTION ────────────────────────────────────────
-// Retry an async function up to N times with delay
 async function retry(fn, { attempts = 3, delay = 1000 } = {}) {
   let lastError
-
   for (let i = 0; i < attempts; i++) {
     try {
       return await fn()
     } catch (err) {
       lastError = err
       if (i < attempts - 1) {
-        await sleep(delay * (i + 1))  // Exponential backoff
+        await sleep(delay * (i + 1))
       }
     }
   }
-
   throw lastError
 }
 
@@ -94,6 +93,7 @@ module.exports = {
   safeJsonParse,
   sleep,
   generateSecureToken,
+  generateApiKey,
   formatDH,
   chunk,
   isValidUUID,

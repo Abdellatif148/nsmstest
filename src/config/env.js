@@ -13,6 +13,11 @@ const envSchema = Joi.object({
   PORT: Joi.number().default(3000),
   API_VERSION: Joi.string().default('v1'),
 
+  // In the Joi schema in src/config/env.js, add:
+  RESEND_API_KEY: Joi.string().required(),
+  EMAIL_FROM: Joi.string().default('Nook SMS <noreply@nook.ma>'),
+
+
   // Security — required in production
   JWT_SECRET: Joi.string().min(32).required(),
   WEBHOOK_SECRET: Joi.string().min(16).required(),
@@ -135,3 +140,4 @@ module.exports = {
     unknown: value.PRICE_UNKNOWN,
   }
 }
+

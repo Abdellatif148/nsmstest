@@ -1,229 +1,174 @@
-// ============================================================
-// src/index.js — Production application entry point
-// This is what starts everything
-// ============================================================
-
-// Load environment FIRST before anything else
+/**
+ * Nook SMS API — Production v2.0
+ * Main entry point
+ */
 require('dotenv').config()
-const config = require('./config/env')  // Validates env or crashes
-const logger = require('./config/logger')
-
 const express = require('express')
 const helmet = require('helmet')
 const cors = require('cors')
 const compression = require('compression')
 const morgan = require('morgan')
-const rateLimit = require('express-rate-limit')
 const { testConnection } = require('./config/database')
+const { startCrons } = require('./crons')
+const logger = require('./config/logger')
 
-// ── CREATE APP ────────────────────────────────────────────
 const app = express()
+const PORT = process.env.PORT || 3000
 
-// ── TRUST PROXY ───────────────────────────────────────────
-// Required when behind Railway/Render/Nginx proxy
-// Allows req.ip to show real client IP
-app.set('trust proxy', 1)
-
-// ── SECURITY HEADERS ─────────────────────────────────────
-// Helmet sets 11 security-related HTTP headers automatically
+// ─── SECURITY MIDDLEWARE ──────────────────────────────────────
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"]
-    }
-  }
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
 }))
 
-// ── CORS ──────────────────────────────────────────────────
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, Postman)
-    if (!origin) return callback(null, true)
-
-    if (config.cors.origins.includes(origin) || config.server.isDev) {
-      callback(null, true)
-    } else {
-      callback(new Error(`CORS: Origin ${origin} not allowed`))
-    }
-  },
-  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Key'],
+  origin: (process.env.ALLOWED_ORIGINS || 'http://localhost:3001').split(',').map(o => o.trim()),
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-Admin-Key', 'X-Nook-Sandbox', 'X-Webhook-Signature'],
   credentials: true
 }))
 
-// ── COMPRESSION ───────────────────────────────────────────
-// Compress all responses — reduces bandwidth by 60-80%
 app.use(compression())
-
-// ── BODY PARSING ──────────────────────────────────────────
-app.use(express.json({ limit: '10mb' }))  // Limit prevents memory attacks
+app.use(express.json({ limit: '10mb' }))
 app.use(express.urlencoded({ extended: true, limit: '10mb' }))
 
-// ── HTTP REQUEST LOGGING ─────────────────────────────────
-// Morgan logs every HTTP request
-const morganFormat = config.server.isDev ? 'dev' : 'combined'
-app.use(morgan(morganFormat, {
-  stream: {
-    write: (message) => logger.info(message.trim(), { category: 'http' })
-  },
-  skip: (req) => req.path === '/health'  // Don't log health checks
-}))
-
-// ── GLOBAL RATE LIMIT ─────────────────────────────────────
-const globalLimit = rateLimit({
-  windowMs: config.rateLimit.windowMs,
-  max: config.rateLimit.max,
-  standardHeaders: true,   // Send RateLimit-* headers
-  legacyHeaders: false,
-  handler: (req, res) => {
-    logger.warn('Rate limit exceeded', { ip: req.ip, path: req.path })
-    res.status(429).json({
-      error: 'Too many requests',
-      code: 'RATE_LIMIT_EXCEEDED',
-      retry_after: Math.ceil(config.rateLimit.windowMs / 1000) + ' seconds'
-    })
-  }
-})
-app.use(globalLimit)
-
-// ── REQUEST LOGGER ───────────────────────────────────────
-const { requestLogger } = require('./middleware/requestLogger')
-app.use(requestLogger)
-
-// ── ROUTES ───────────────────────────────────────────────
-const version = config.server.version
-
-app.use(`/${version}/sms`, require('./routes/sms'))
-app.use(`/${version}/otp`, require('./routes/otp'))
-app.use(`/${version}/analytics`, require('./routes/analytics'))
-app.use(`/${version}/clients`, require('./routes/clients'))
-
-// Admin routes — only accessible with X-Admin-Key header
-// Bind to internal path so reverse proxy can block external access
-app.use(`/${version}/admin`, require('./routes/admin'))
-
-// ── START CRON JOBS ───────────────────────────────────────
-if (config.server.isProd) {
-  require('./crons')  // Starts all scheduled jobs
+// ─── LOGGING ─────────────────────────────────────────────────
+if (process.env.NODE_ENV !== 'test') {
+  app.use(morgan('combined', {
+    stream: { write: msg => logger.info(msg.trim()) },
+    skip: (req) => req.path === '/health'
+  }))
 }
 
-// ── HEALTH CHECK ─────────────────────────────────────────
-app.get('/health', async (req, res) => {
-  const { checkGatewayHealth } = require('./services/GatewayService')
-
-  try {
-    const gatewayHealth = await checkGatewayHealth()
-
-    res.json({
-      status: 'ok',
-      service: 'Nook SMS API',
-      version: '1.0.0',
-      environment: config.server.env,
-      timestamp: new Date().toISOString(),
-      gateways: gatewayHealth,
-      uptime: process.uptime() + ' seconds'
-    })
-  } catch {
-    res.json({
-      status: 'ok',
-      service: 'Nook SMS API',
-      timestamp: new Date().toISOString()
-    })
-  }
-})
-
-// ── API INFO ─────────────────────────────────────────────
-app.get('/', (req, res) => {
+// ─── HEALTH CHECK ─────────────────────────────────────────────
+app.get('/health', (req, res) => {
   res.json({
-    name: 'Nook SMS API',
-    description: "Morocco's production-grade SMS infrastructure",
-    version: '1.0.0',
-    documentation: 'https://docs.nook.ma',
-    endpoints: {
-      register: `POST /${version}/clients/register`,
-      send: `POST /${version}/sms/send`,
-      bulk: `POST /${version}/sms/bulk`,
-      status: `GET /${version}/sms/status/:messageId`,
-      analytics: `GET /${version}/analytics/overview`,
-      account: `GET /${version}/clients/me`
-    }
+    status: 'ok',
+    service: 'Nook SMS API',
+    version: '2.0.0',
+    environment: process.env.NODE_ENV || 'development',
+    uptime: process.uptime().toFixed(2),
+    timestamp: new Date().toISOString(),
+    memory: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`
   })
 })
 
-// ── 404 HANDLER ───────────────────────────────────────────
+// ─── ROUTES ───────────────────────────────────────────────────
+// Auth
+app.use('/v1/auth', require('./routes/auth'))
+
+// SMS Core
+app.use('/v1/sms', require('./routes/sms'))
+
+// OTP
+app.use('/v1/otp', require('./routes/otp'))
+
+// Analytics
+app.use('/v1/analytics', require('./routes/analytics'))
+
+// Client account
+app.use('/v1/clients', require('./routes/clients'))
+
+// Templates
+app.use('/v1/templates', require('./routes/templates'))
+
+// Contact Lists
+app.use('/v1/contacts', require('./routes/contacts'))
+
+// Scheduled Messages
+app.use('/v1/scheduled', require('./routes/scheduled'))
+
+// Advanced Features
+const { lookupRouter, linksRouter, redirectRouter, senderRouter } = require('./routes/advanced')
+app.use('/v1/lookup', lookupRouter)
+app.use('/v1/links', linksRouter)
+app.use('/v1/sender-ids', senderRouter)
+
+// Short link redirects (public, no auth)
+app.use('/r', redirectRouter)
+
+// Reseller
+app.use('/v1/reseller', require('./routes/reseller'))
+
+// Admin
+app.use('/v1/admin', require('./routes/admin'))
+
+// ─── SANDBOX MODE MIDDLEWARE ──────────────────────────────────
+app.use('/sandbox/*', (req, res, next) => {
+  req.sandboxMode = true
+  next()
+})
+app.use('/sandbox/v1', (req, res, next) => {
+  // Rewrite to normal routes but with sandbox flag
+  req.url = req.url.replace('/sandbox', '')
+  req.sandboxMode = true
+  next()
+})
+
+// ─── 404 HANDLER ─────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({
     error: 'Endpoint not found',
     code: 'NOT_FOUND',
     path: req.path,
-    docs: 'https://docs.nook.ma'
+    docs: 'https://dashboard.nook.ma/docs'
   })
 })
 
-// ── GLOBAL ERROR HANDLER ──────────────────────────────────
+// ─── GLOBAL ERROR HANDLER ────────────────────────────────────
 app.use((err, req, res, next) => {
-  // CORS error
-  if (err.message?.includes('CORS')) {
-    return res.status(403).json({
-      error: 'CORS policy violation',
-      code: 'CORS_ERROR'
-    })
-  }
-
-  logger.error('Unhandled error', {
+  logger.error('Unhandled error:', {
     error: err.message,
-    stack: config.server.isDev ? err.stack : undefined,
+    stack: err.stack,
     path: req.path,
     method: req.method
   })
 
-  res.status(500).json({
-    error: 'Internal server error',
-    code: 'SERVER_ERROR',
-    ...(config.server.isDev && { detail: err.message })
+  if (res.headersSent) return next(err)
+
+  res.status(err.status || 500).json({
+    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    code: err.code || 'SERVER_ERROR',
+    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
   })
 })
 
-// ── GRACEFUL SHUTDOWN ─────────────────────────────────────
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM received — shutting down gracefully')
-  server.close(() => {
-    logger.info('Server closed')
-    process.exit(0)
-  })
-})
-
-process.on('uncaughtException', (err) => {
-  logger.error('Uncaught exception', { error: err.message, stack: err.stack })
-  process.exit(1)
-})
-
-process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled rejection', { reason })
-})
-
-// ── START SERVER ─────────────────────────────────────────
+// ─── START SERVER ─────────────────────────────────────────────
 async function start() {
-  // Test database connection before accepting traffic
-  await testConnection()
+  try {
+    await testConnection()
+    logger.info('✓ Database connected')
 
-  const server = app.listen(config.server.port, () => {
-    logger.info(`
-╔═══════════════════════════════════════════════╗
-║          NOOK SMS API — PRODUCTION            ║
-║   http://localhost:${config.server.port}                    ║
-║   Environment: ${config.server.env.padEnd(29)}║
-║   Version: ${config.server.version.padEnd(34)}║
-╚═══════════════════════════════════════════════╝`)
-  })
+    app.listen(PORT, () => {
+      logger.info(`✓ Nook SMS API v2.0 running on port ${PORT}`)
+      logger.info(`  Environment: ${process.env.NODE_ENV || 'development'}`)
+      logger.info(`  Docs: https://dashboard.nook.ma/docs`)
+    })
 
-  return server
+    if (process.env.NODE_ENV !== 'test') {
+      startCrons()
+    }
+
+    // Graceful shutdown
+    process.on('SIGTERM', () => {
+      logger.info('SIGTERM received, shutting down...')
+      process.exit(0)
+    })
+
+    process.on('uncaughtException', (err) => {
+      logger.error('Uncaught exception:', err)
+      process.exit(1)
+    })
+
+    process.on('unhandledRejection', (reason) => {
+      logger.error('Unhandled rejection:', reason)
+    })
+  } catch (err) {
+    logger.error('Failed to start server:', err)
+    process.exit(1)
+  }
 }
 
-start().catch(err => {
-  logger.error('Failed to start server', { error: err.message })
-  process.exit(1)
-})
+start()
 
 module.exports = app
